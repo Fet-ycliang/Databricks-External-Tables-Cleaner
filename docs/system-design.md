@@ -274,6 +274,223 @@ graph TB
 
 ---
 
+### 3.6 common/config.py ✨ NEW
+
+**職責：**
+- 管理清理工具的所有配置參數
+- 提供白名單/黑名單模式匹配功能
+- 檢查保留條件（建立日期、最後存取時間）
+
+**核心類別：CleanupConfig**
+
+```python
+class CleanupConfig:
+    def __init__(
+        self,
+        dry_run: bool = True,
+        whitelist_patterns: Optional[List[str]] = None,
+        blacklist_patterns: Optional[List[str]] = None,
+        min_create_date: Optional[date] = None,
+        max_last_access_age_days: Optional[int] = None,
+        require_confirmation: bool = False,
+        estimate_storage_size: bool = False
+    )
+```
+
+**主要方法：**
+
+1. **is_table_deletion_allowed(table_full_name: str) -> tuple[bool, str]**
+   - 檢查表是否允許刪除
+   - 先檢查白名單（優先級最高）
+   - 再檢查黑名單
+   - 回傳 (是否允許, 原因說明)
+
+2. **check_retention_conditions(create_time, last_access_time) -> tuple[bool, str]**
+   - 檢查表是否符合保留條件
+   - 驗證建立日期和最後存取時間
+   - 回傳 (是否允許刪除, 原因說明)
+
+3. **to_dict() / from_dict()**
+   - 配置的序列化與反序列化
+   - 支援從 JSON 檔案載入配置
+
+**預設配置範例：**
+
+```python
+# 安全預設配置
+DEFAULT_CONFIG = CleanupConfig(
+    dry_run=True,
+    require_confirmation=True
+)
+
+# 生產環境安全配置
+PRODUCTION_SAFE_CONFIG = CleanupConfig(
+    dry_run=True,
+    whitelist_patterns=['prod.*', 'production.*', 'critical_*'],
+    blacklist_patterns=['system.*', 'metadata.*'],
+    max_last_access_age_days=180,
+    require_confirmation=True
+)
+```
+
+**用途：**
+- 集中管理所有安全控制參數
+- 提供可重複使用的配置範本
+- 支援從檔案載入配置
+
+---
+
+### 3.7 新增的安全函式 ✨ NEW
+
+#### 函式：`drop_table_definition_without_storage_safe()`
+
+**職責：**
+- 升級版的清理函式，支援完整的安全功能
+- 整合 dry-run、白名單/黑名單、保留條件等檢查
+
+**簽名：**
+```python
+def drop_table_definition_without_storage_safe(
+    spark: SparkSession,
+    df: DataFrame,
+    log: logs,
+    config: Optional[CleanupConfig] = None
+) -> Tuple[int, List[Dict]]
+```
+
+**處理流程：**
+1. 載入配置（如未提供則使用預設安全配置）
+2. 對每個表執行以下檢查：
+   - 白名單/黑名單檢查
+   - 儲存是否存在檢查
+   - （可選）保留條件檢查
+3. 根據 dry_run 模式決定：
+   - `dry_run=True`：記錄將被刪除的表
+   - `dry_run=False`：實際執行 DROP TABLE
+4. 記錄詳細的統計摘要
+
+**回傳值：**
+- `deleted`: 刪除（或將被刪除）的表數量
+- `candidates`: 所有候選表的詳細資訊列表
+  - `table_name`: 完整表名稱
+  - `action`: 採取的動作（deleted/skipped_whitelist/skipped_blacklist等）
+  - `reason`: 原因說明
+  - `location`: 儲存路徑
+
+**統計資訊：**
+函式會輸出詳細的統計摘要：
+- 刪除（或預計刪除）的表數量
+- 因白名單跳過的數量
+- 因黑名單跳過的數量
+- 因資料存在跳過的數量
+- 總計檢查的表數量
+
+---
+
+#### 函式：`confirm_deletion_interactive()`
+
+**職責：**
+- 提供互動式確認功能
+- 顯示候選表清單並要求使用者確認
+
+**簽名：**
+```python
+def confirm_deletion_interactive(
+    candidates: List[Dict],
+    dry_run: bool = False
+) -> bool
+```
+
+**處理流程：**
+1. 過濾出將被刪除的表（action='dry_run_candidate' 或 'deleted'）
+2. 以表格格式顯示候選表清單
+3. 顯示統計資訊（總表數、預計釋放空間等）
+4. 要求使用者輸入 `YES` 確認
+
+**使用範例：**
+```python
+deleted, candidates = drop_table_definition_without_storage_safe(
+    spark, tabledetailsDF, logger, config
+)
+
+if config.require_confirmation:
+    if not confirm_deletion_interactive(candidates, config.dry_run):
+        print('操作已取消')
+        return
+```
+
+**適用場景：**
+- Notebook 互動環境
+- CLI 執行
+- 不適用於自動化 Job（無互動環境）
+
+---
+
+### 3.8 notebooks/clean_tables_with_dryrun.py ✨ NEW
+
+**職責：**
+- 示範如何使用進階安全功能
+- 提供完整的 Dry-run + 互動確認流程
+
+**特色：**
+1. 使用 Databricks Widgets 接收參數
+2. 支援動態設定白名單/黑名單
+3. 完整的 Dry-run 流程示範
+4. 將結果轉換為 DataFrame 方便查看
+5. 提供多種使用範例和最佳實務建議
+
+**執行流程：**
+1. 設定參數（store、schema、dry_run、whitelist等）
+2. 建立 CleanupConfig 配置
+3. 掃描表並取得詳細資訊
+4. 執行清理（dry-run 或實際刪除）
+5. 顯示候選表 DataFrame
+6. （可選）互動式確認
+7. 輸出統計摘要
+
+**與原始 Notebook 的差異：**
+- 原始版本：直接刪除，無安全控制
+- 新版本：支援 dry-run、白名單/黑名單、互動確認
+
+---
+
+### 3.9 tests/test_config.py ✨ NEW
+
+**職責：**
+- 測試 CleanupConfig 類別的各種功能
+- 驗證白名單/黑名單模式匹配
+- 測試保留條件檢查
+
+**測試類別：**
+
+1. **TestCleanupConfig**
+   - 測試預設配置
+   - 測試自訂配置
+   - 測試序列化/反序列化
+
+2. **TestWhitelistBlacklist**
+   - 測試白名單功能
+   - 測試黑名單功能
+   - 測試優先級（白名單 > 黑名單）
+   - 測試萬用字元匹配
+
+3. **TestRetentionConditions**
+   - 測試建立日期條件
+   - 測試最後存取時間條件
+   - 測試多個條件組合
+
+4. **TestConfigIntegration**
+   - 測試完整的配置場景
+   - 測試生產環境配置範例
+   - 測試測試環境配置範例
+
+**涵蓋率：**
+- CleanupConfig 類別的所有公開方法
+- 各種邊界條件和異常情況
+- 實際使用場景的整合測試
+
+---
+
 ### 3.4 scripts/context.py 與 notebooks/context.py
 
 **職責：**
@@ -301,6 +518,8 @@ graph TB
 **執行方式：**
 - 使用 `databricks-connect` 連接到遠端 Databricks cluster
 - 在實際的 Databricks 環境中執行測試
+
+---
 
 ## 4. 錯誤處理與 Logging 策略
 
@@ -363,9 +582,30 @@ graph TB
    - 在執行結束時，彙總並報告失敗的表
    - 可考慮整合 email 或 Slack 通知
 
-#### 4.2.3 驗證與安全檢查
+#### 4.2.3 驗證與安全檢查 ✅ 已實作
 
-**建議加入：**
+**已實作的安全功能：**
+1. **Dry-run 模式：**
+   - 新增函式 `drop_table_definition_without_storage_safe()`
+   - 支援 `dry_run=True` 參數，僅記錄將被刪除的表
+   - 明確標示 `[DRY-RUN]` 避免混淆
+
+2. **白名單/黑名單機制：**
+   - 透過 `CleanupConfig` 類別管理
+   - 支援萬用字元模式匹配（`*` 和 `?`）
+   - 白名單優先級最高，黑名單次之
+
+3. **保留條件檢查：**
+   - 支援建立日期篩選 (`min_create_date`)
+   - 支援最後存取時間篩選 (`max_last_access_age_days`)
+   - 無時間資訊時會警告使用者
+
+4. **互動式確認：**
+   - `confirm_deletion_interactive()` 函式
+   - 顯示候選表清單並要求輸入 YES 確認
+   - 適用於 Notebook 和 CLI 環境
+
+**建議未來加入：**
 1. **Location 路徑驗證：**
    - 檢查 Location 是否為合法的外部儲存路徑
    - 避免誤刪內部管理的資料
@@ -373,10 +613,6 @@ graph TB
 2. **表類型再確認：**
    - 在刪除前再次確認表的類型（確保是 EXTERNAL）
    - 避免誤刪 MANAGED 表
-
-3. **Dry-run 模式：**
-   - 新增參數 `dry_run=True`
-   - 僅記錄將被刪除的表，不實際執行
 
 #### 4.2.4 日誌等級管理
 
@@ -409,10 +645,47 @@ graph TB
 1. **單執行緒處理**：目前逐一處理表，無法充分利用 Spark 的分散式運算能力
 2. **無批次操作**：每個表都執行獨立的 SQL 命令，增加 metastore 負擔
 3. **硬編碼的過濾條件**：只支援 Delta 和 Parquet，寫死在程式碼中
-4. **缺少配置檔**：所有參數都需要在執行時提供，不支援設定檔
-5. **測試覆蓋率不足**：主要的刪除邏輯缺少完整的端到端測試
+4. ~~**缺少配置檔**~~：✅ 已解決 - 已新增 `CleanupConfig` 類別支援配置管理
+5. **測試覆蓋率不足**：主要的刪除邏輯仍需更完整的端到端測試（已新增單元測試但缺少整合測試）
 
-### 5.2 未來改進方向
+### 5.2 已完成的改進 ✅
+
+1. **Dry-run 模式**：✅ 已實作
+   - 新增 `drop_table_definition_without_storage_safe()` 函式
+   - 支援預覽模式，不實際刪除
+   - 提供詳細的候選表資訊
+
+2. **白名單/黑名單機制**：✅ 已實作
+   - 透過 `CleanupConfig` 管理
+   - 支援萬用字元模式匹配
+   - 白名單優先級最高
+
+3. **保留條件**：✅ 已實作
+   - 支援建立日期篩選
+   - 支援最後存取時間篩選
+   - 缺少時間資訊時會警告
+
+4. **互動式確認**：✅ 已實作
+   - `confirm_deletion_interactive()` 函式
+   - 顯示候選表清單並要求確認
+   - 適用於 Notebook 和 CLI
+
+5. **配置管理系統**：✅ 已實作
+   - `CleanupConfig` 類別集中管理所有參數
+   - 支援序列化/反序列化
+   - 提供預設配置範本
+
+6. **完整的單元測試**：✅ 已實作
+   - `test_config.py` 涵蓋配置相關功能
+   - 測試白名單/黑名單模式匹配
+   - 測試保留條件檢查
+
+7. **範例與文件**：✅ 已實作
+   - 新增 `clean_tables_with_dryrun.py` 範例 Notebook
+   - 新增 `config-examples.md` 配置範例文件
+   - 更新 README 和 system-design.md
+
+### 5.3 未來改進方向
 
 詳細的優化建議請參考 `docs/optimization-notes.md`。
 
