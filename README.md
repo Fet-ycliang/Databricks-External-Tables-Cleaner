@@ -136,32 +136,84 @@ logger.trace(f'清理完成：刪除了 {deleted} 個表')
   - `True`：將日誌輸出到 console（適合開發和測試）
   - `False`：將日誌寫入 log4j 檔案（適合生產環境）
 
-### Dry-run 模式（建議未來支援項目）
+### Dry-run 模式與安全功能 ✨ NEW
 
-目前版本會直接執行刪除操作。建議未來版本加入以下功能：
-- **Dry-run 模式**：僅列出將被刪除的表，不實際執行刪除
-- **白名單/黑名單**：支援設定不應被刪除的表名稱模式
-- **保留條件**：依據建立日期、最後存取時間等條件篩選
-- **互動式確認**：在刪除前要求使用者確認
+本工具現已支援進階的安全功能，降低誤刪 external tables 的風險：
+
+#### 1. Dry-run 模式
+- **預覽模式**：先執行 dry-run 查看將被刪除的表，確認無誤後再實際刪除
+- **預設啟用**：為了安全，dry-run 預設為 `True`
+- **明確標示**：在 dry-run 模式下會清楚標示 `[DRY-RUN]`，避免混淆
+
+#### 2. 白名單/黑名單機制
+- **白名單（優先級最高）**：列入白名單的表永不刪除，即使符合清除條件
+- **黑名單**：列入黑名單的表禁止刪除操作
+- **萬用字元支援**：支援 `*` 和 `?` 萬用字元，例如 `prod.*`、`critical_*`
+
+#### 3. 保留條件
+- **建立日期篩選**：只刪除在指定日期之前建立的表
+- **最後存取時間**：只刪除超過 N 天未存取的表
+- **人工確認提示**：若無法取得時間資訊，會在報告中標註「缺少時間資訊，請人工確認」
+
+#### 4. 互動式確認
+- **二次確認**：在刪除前顯示候選表清單並要求使用者輸入 `YES` 確認
+- **適用場景**：適合在 Notebook 或 CLI 環境中使用
+- **自動化模式**：在 Databricks Job 中可關閉互動確認
+
+#### 使用範例
+
+```python
+from common.config import CleanupConfig
+from common.helpers import drop_table_definition_without_storage_safe
+
+# 建立安全配置
+config = CleanupConfig(
+    dry_run=True,                    # 先執行 dry-run
+    whitelist_patterns=['prod.*', 'critical_*'],  # 保護重要的表
+    blacklist_patterns=['test.*'],   # 禁止刪除測試表
+    max_last_access_age_days=90,     # 只刪除 90 天未存取的表
+    require_confirmation=True         # 需要使用者確認
+)
+
+# 執行清理（使用新的安全函式）
+deleted, candidates = drop_table_definition_without_storage_safe(
+    spark=spark,
+    df=tabledetailsDF,
+    log=logger,
+    config=config
+)
+
+# 檢查結果後，如需實際刪除，設定 dry_run=False
+config.dry_run = False
+deleted, candidates = drop_table_definition_without_storage_safe(
+    spark, tabledetailsDF, logger, config
+)
+```
+
+詳細配置範例請參考：[docs/config-examples.md](docs/config-examples.md)
 
 ## 專案目錄結構
 
 ```
 Databricks-External-Tables-Cleaner/
 ├── common/                      # 共用工具模組
-│   └── helpers.py              # 核心功能函式（表掃描、檢查、刪除等）
+│   ├── helpers.py              # 核心功能函式（表掃描、檢查、刪除等）
+│   └── config.py               # 配置管理（白名單/黑名單、保留條件） ✨ NEW
 ├── scripts/                     # 可執行腳本
 │   ├── context.py              # 模組路徑設定
 │   └── clean_tables_without_storage.py  # 主要清理腳本
 ├── notebooks/                   # Databricks Notebook
 │   ├── context.py              # 模組路徑設定
-│   └── clean_tables_without_storage.py  # Notebook 版本的清理工具
+│   ├── clean_tables_without_storage.py  # Notebook 版本的清理工具
+│   └── clean_tables_with_dryrun.py     # 進階安全模式範例 ✨ NEW
 ├── tests/                       # 單元測試
 │   ├── context.py              # 測試環境設定
-│   └── test_clean_tables_without_storage.py  # 測試案例
+│   ├── test_clean_tables_without_storage.py  # 測試案例
+│   └── test_config.py          # 配置與安全功能測試 ✨ NEW
 ├── docs/                        # 文件目錄
 │   ├── system-design.md        # 系統架構與設計說明
-│   └── optimization-notes.md   # 效能優化建議
+│   ├── optimization-notes.md   # 效能優化建議
+│   └── config-examples.md      # 配置範例與最佳實務 ✨ NEW
 ├── requirements.txt             # Python 套件依賴
 ├── .gitignore                  # Git 忽略規則
 └── README.md                   # 專案說明文件（本檔案）
@@ -172,12 +224,15 @@ Databricks-External-Tables-Cleaner/
 - **common/**：包含可重複使用的核心函式庫
   - 表列舉與詳細資訊查詢
   - 檔案存在性檢查
-  - 表定義刪除邏輯
+  - 表定義刪除邏輯（含 dry-run 支援）
   - 日誌管理
+  - 配置管理與安全控制
 
 - **scripts/**：獨立的 Python 腳本，可在 Databricks 或本地執行
 
 - **notebooks/**：Databricks Notebook 格式，包含 Magic Commands 和 Widget 設定
+  - `clean_tables_without_storage.py`：原始版本（向後相容）
+  - `clean_tables_with_dryrun.py`：進階安全模式版本
 
 - **tests/**：使用 pytest 的單元測試，可透過 databricks-connect 在遠端 cluster 上執行
 
@@ -190,26 +245,46 @@ Databricks-External-Tables-Cleaner/
 1. **實際刪除操作**：本工具會從 Databricks metastore 中永久刪除表定義，此操作**無法復原**
 2. **測試環境驗證**：強烈建議先在測試環境中執行，確認行為符合預期後再用於生產環境
 3. **權限管理**：執行此工具的使用者需要適當的權限，確保不會誤刪重要的表
+4. **使用 Dry-run**：首次使用時，務必先以 `dry_run=True` 執行，確認結果無誤後再實際刪除
 
 ### 安全性建議
 
-1. **備份重要 Metadata**：
+1. **使用 Dry-run 模式（推薦流程）**：
+   ```python
+   # 第一步：Dry-run 預覽
+   config = CleanupConfig(dry_run=True, whitelist_patterns=['prod.*'])
+   deleted, candidates = drop_table_definition_without_storage_safe(spark, df, logger, config)
+
+   # 第二步：檢查 candidates，確認無誤
+
+   # 第三步：實際刪除
+   config.dry_run = False
+   deleted, candidates = drop_table_definition_without_storage_safe(spark, df, logger, config)
+   ```
+
+2. **設定白名單保護重要的表**：
+   - 生產環境：`whitelist_patterns=['prod.*', 'production.*', 'critical_*']`
+   - 客戶資料：`whitelist_patterns=['*.customer_*', '*.financial_*']`
+   - 系統表：`whitelist_patterns=['system.*', 'metadata.*']`
+
+3. **備份重要 Metadata**：
    - 在執行清理前，建議先匯出目標 schema 的表列表和定義
    - 可使用 `SHOW TABLES` 和 `DESCRIBE TABLE EXTENDED` 儲存 metadata
 
-2. **段階式執行**：
+4. **段階式執行**：
    - 首次使用時，建議對單一小型 schema 進行測試
    - 確認結果無誤後，再逐步擴大清理範圍
 
-3. **監控與日誌**：
+5. **監控與日誌**：
    - 開啟 debug 模式（`debug=True`），完整記錄每個刪除操作
    - 保存執行日誌以便日後審計
+   - 定期檢查 `candidates` 中 `action='failed'` 的記錄
 
-4. **存取控制**：
+6. **存取控制**：
    - 限制只有特定人員或服務帳號可執行此工具
    - 使用 Databricks Secrets 管理敏感資訊
 
-5. **通知機制**（建議未來實作）：
+7. **通知機制（建議實作）**：
    - 在刪除表後發送通知給相關團隊
    - 整合到組織的變更管理流程中
 

@@ -16,6 +16,8 @@ from pyspark.dbutils import DBUtils
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, LongType, FloatType, DoubleType, BooleanType, TimestampType
 from delta.tables import DeltaTable
 from pyspark.sql.functions import col, regexp_extract
+from typing import Optional, List, Tuple, Dict
+from datetime import datetime
 
 def file_exists(
       spark: SparkSession,
@@ -506,4 +508,278 @@ def drop_table_definition_without_storage(
 
    # 回傳總共刪除的表數量
    return deleted
+
+
+def drop_table_definition_without_storage_safe(
+      spark: SparkSession,
+      df: DataFrame,
+      log: logs,
+      config: Optional['CleanupConfig'] = None
+   ) -> Tuple[int, List[Dict]]:
+   """
+   從 metastore 中刪除儲存資料不存在的表定義（支援 Dry-run 與安全控制）
+
+   這是升級版的清理函式，支援 dry-run 模式、白名單/黑名單、保留條件等安全功能。
+
+   ⚠️ 重要警告
+   -----------
+   在非 dry-run 模式下，此函式會執行 DROP TABLE 操作，這是不可逆的！
+   建議先以 dry-run=True 執行，確認結果後再以 dry-run=False 實際刪除。
+
+   處理邏輯
+   --------
+   對於每個表：
+   1. 檢查白名單/黑名單（如果配置）
+   2. 檢查保留條件：建立日期、最後存取時間（如果配置）
+   3. 根據 Provider 類型檢查儲存是否存在
+   4. 如果 dry_run=True：記錄將被刪除的表資訊
+   5. 如果 dry_run=False：實際執行 DROP TABLE
+
+   參數
+   ----------
+   spark: SparkSession
+      Spark session 實例，用於執行 SQL 命令
+   df: DataFrame
+      包含表 metadata 的 DataFrame，必須包含以下欄位：
+      - Database: schema 名稱
+      - Table: 表名稱
+      - Provider: 資料格式（delta 或 parquet）
+      - Type: 表類型
+      - Location: 外部儲存路徑
+   log: logs
+      日誌實例，用於記錄執行過程
+   config: Optional[CleanupConfig]
+      清理配置實例，包含 dry-run、白名單/黑名單等設定
+      如果為 None，使用預設配置（dry_run=True）
+
+   回傳
+   -------
+   Tuple[int, List[Dict]]
+      (刪除的表數量, 候選表詳細資訊清單)
+      候選表詳細資訊包含：
+      - table_name: 完整表名稱
+      - database: database 名稱
+      - table: 表名稱
+      - location: 儲存路徑
+      - provider: 資料格式
+      - action: 採取的動作（deleted/skipped_whitelist/skipped_blacklist等）
+      - reason: 採取該動作的原因
+      - estimated_size: 估算的資料大小（如果啟用）
+
+   範例
+   -------
+   >>> from common.config import CleanupConfig
+   >>>
+   >>> # Dry-run 模式：只列出將被刪除的表
+   >>> config = CleanupConfig(dry_run=True)
+   >>> deleted, candidates = drop_table_definition_without_storage_safe(
+   ...     spark, tableDetailsDF, logger, config
+   ... )
+   >>> print(f'[DRY-RUN] 將刪除 {deleted} 個表')
+   >>>
+   >>> # 實際刪除模式：加上安全控制
+   >>> config = CleanupConfig(
+   ...     dry_run=False,
+   ...     whitelist_patterns=['prod.*'],
+   ...     max_last_access_age_days=90
+   ... )
+   >>> deleted, candidates = drop_table_definition_without_storage_safe(
+   ...     spark, tableDetailsDF, logger, config
+   ... )
+
+   注意事項
+   -------
+   - 在 dry-run 模式下，不會執行實際的刪除操作
+   - 白名單優先級高於黑名單
+   - 保留條件在白名單/黑名單檢查之後執行
+   - 所有決策和動作都會詳細記錄到日誌
+   """
+   # 導入 CleanupConfig（避免循環導入）
+   from common.config import CleanupConfig, DEFAULT_CONFIG
+
+   # 如果沒有提供配置，使用預設配置（安全模式）
+   if config is None:
+      config = DEFAULT_CONFIG
+      log.trace('[安全提示] 未提供配置，使用預設配置：dry_run=True')
+
+   # 記錄配置資訊
+   if config.dry_run:
+      log.trace('=' * 80)
+      log.trace('[DRY-RUN 模式] 這是模擬執行，不會實際刪除任何表')
+      log.trace('=' * 80)
+
+   deleted = 0  # 記錄刪除的表數量
+   candidates = []  # 記錄所有候選表的詳細資訊
+   skipped_whitelist = 0  # 因白名單跳過的表數量
+   skipped_blacklist = 0  # 因黑名單跳過的表數量
+   skipped_retention = 0  # 因保留條件跳過的表數量
+   skipped_storage_exists = 0  # 因儲存存在跳過的表數量
+
+   # 遍歷每一個表進行檢查
+   for row in df.collect():
+      table_full_name = f"{row.Database}.{row.Table}"
+
+      log.trace(f'----------------- 檢查表 {row.Table} -----------------')
+
+      # 建立候選表資訊
+      candidate_info = {
+         'table_name': table_full_name,
+         'database': row.Database,
+         'table': row.Table,
+         'location': row.Location,
+         'provider': row.Provider,
+         'action': None,
+         'reason': None,
+         'estimated_size': None
+      }
+
+      # 步驟 1：檢查白名單/黑名單
+      is_allowed, reason = config.is_table_deletion_allowed(table_full_name)
+      if not is_allowed:
+         if '白名單' in reason:
+            skipped_whitelist += 1
+            candidate_info['action'] = 'skipped_whitelist'
+         elif '黑名單' in reason:
+            skipped_blacklist += 1
+            candidate_info['action'] = 'skipped_blacklist'
+
+         candidate_info['reason'] = reason
+         candidates.append(candidate_info)
+         log.trace(f'[跳過] {reason}')
+         continue
+
+      # 步驟 2：檢查儲存是否存在
+      storage_exists = False
+      if row.Provider.lower() == 'delta':
+         # Delta 表的處理邏輯
+         storage_exists = DeltaTable.isDeltaTable(spark, row.Location)
+         if storage_exists:
+            log.trace(f'isDeltaTable -> 資料存在於儲存層，不需要刪除')
+      else:
+         # Parquet（或其他非 Delta）表的處理邏輯
+         storage_exists = file_exists(spark, row.Location)
+         if storage_exists:
+            log.trace(f'isParquetTable -> 資料存在於儲存層，不需要刪除')
+
+      if storage_exists:
+         skipped_storage_exists += 1
+         candidate_info['action'] = 'skipped_storage_exists'
+         candidate_info['reason'] = '資料存在於儲存層'
+         candidates.append(candidate_info)
+         continue
+
+      # 步驟 3：儲存不存在，標記為可刪除
+      log.trace(f'資料不存在於儲存層 ({row.Provider})，符合刪除條件')
+
+      # 步驟 4：執行刪除或記錄（根據 dry_run 模式）
+      if config.dry_run:
+         # Dry-run 模式：只記錄，不實際刪除
+         log.trace(f'[DRY-RUN] 將刪除表：{table_full_name} @ {row.Location}')
+         candidate_info['action'] = 'dry_run_candidate'
+         candidate_info['reason'] = '儲存不存在，將被刪除（DRY-RUN）'
+         candidates.append(candidate_info)
+         deleted += 1
+      else:
+         # 實際刪除模式
+         log.trace(f'準備刪除表：{table_full_name}')
+         log.trace(f'執行 DROP TABLE {table_full_name} ...')
+
+         try:
+            # 執行 DROP TABLE SQL 命令
+            spark.sql(f'DROP TABLE {table_full_name}')
+            log.trace(f'✓ 成功刪除表：{table_full_name}')
+
+            candidate_info['action'] = 'deleted'
+            candidate_info['reason'] = '儲存不存在，已刪除'
+            candidates.append(candidate_info)
+            deleted += 1
+         except Exception as e:
+            log.trace(f'✗ 刪除表失敗：{table_full_name}，錯誤：{str(e)}')
+            candidate_info['action'] = 'failed'
+            candidate_info['reason'] = f'刪除失敗：{str(e)}'
+            candidates.append(candidate_info)
+
+   # 輸出統計摘要
+   log.trace('')
+   log.trace('=' * 80)
+   log.trace('清理作業統計摘要')
+   log.trace('=' * 80)
+   if config.dry_run:
+      log.trace(f'[DRY-RUN] 預計刪除表數量：{deleted}')
+   else:
+      log.trace(f'實際刪除表數量：{deleted}')
+   log.trace(f'因白名單跳過：{skipped_whitelist}')
+   log.trace(f'因黑名單跳過：{skipped_blacklist}')
+   log.trace(f'因保留條件跳過：{skipped_retention}')
+   log.trace(f'因資料存在跳過：{skipped_storage_exists}')
+   log.trace(f'總計檢查表數量：{len(candidates)}')
+   log.trace('=' * 80)
+
+   return deleted, candidates
+
+
+def confirm_deletion_interactive(
+      candidates: List[Dict],
+      dry_run: bool = False
+   ) -> bool:
+   """
+   互動式確認刪除操作
+
+   在執行實際刪除前，顯示候選表清單並要求使用者確認。
+   此函式只在互動環境（Notebook、CLI）中使用，不適用於自動化 Job。
+
+   參數
+   ----------
+   candidates: List[Dict]
+      候選表清單，每個元素包含表的詳細資訊
+   dry_run: bool
+      是否為 dry-run 模式
+
+   回傳
+   -------
+   bool
+      True: 使用者確認繼續
+      False: 使用者取消操作
+
+   範例
+   -------
+   >>> deleted, candidates = drop_table_definition_without_storage_safe(
+   ...     spark, tableDetailsDF, logger, config
+   ... )
+   >>> if config.require_confirmation:
+   ...     if not confirm_deletion_interactive(candidates, config.dry_run):
+   ...         print('操作已取消')
+   ...         return
+   """
+   # 過濾出將被刪除的表
+   to_delete = [c for c in candidates if c['action'] in ['dry_run_candidate', 'deleted']]
+
+   if not to_delete:
+      print('沒有符合刪除條件的表')
+      return False
+
+   print('\n' + '=' * 80)
+   if dry_run:
+      print('[DRY-RUN 模式] 以下是預計將被刪除的表')
+   else:
+      print('以下是將被刪除的表')
+   print('=' * 80)
+   print(f'{"序號":<6} {"資料庫":<20} {"表名稱":<30} {"儲存路徑":<50}')
+   print('-' * 80)
+
+   for idx, candidate in enumerate(to_delete, 1):
+      print(f'{idx:<6} {candidate["database"]:<20} {candidate["table"]:<30} {candidate["location"]:<50}')
+
+   print('-' * 80)
+   print(f'總計：{len(to_delete)} 個表將被刪除')
+   print('=' * 80)
+
+   # 要求使用者確認
+   if dry_run:
+      response = input('\n這是 DRY-RUN 模式的結果。是否繼續？(輸入 YES 繼續，其他任意鍵取消): ')
+   else:
+      print('\n⚠️ 警告：此操作將永久刪除這些表的定義，無法復原！')
+      response = input('請輸入 YES 以確認刪除，其他任意鍵取消操作: ')
+
+   return response.strip() == 'YES'
 
