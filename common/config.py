@@ -290,3 +290,158 @@ TEST_CONFIG = CleanupConfig(
     max_last_access_age_days=30,  # 測試環境：30 天未存取即可刪除
     require_confirmation=False  # 測試環境可以不需要確認
 )
+
+
+class OrphanScanConfig:
+    """
+    孤兒目錄掃描的配置類別
+
+    此類別封裝孤兒目錄掃描相關的配置參數。
+
+    屬性
+    -------
+    enabled: bool
+        是否啟用孤兒目錄掃描，預設為 True
+
+    base_paths: List[str]
+        要掃描的基礎 Storage 路徑清單
+        範例: ['abfss://data@myacct.dfs.core.windows.net/raw/',
+                'abfss://data@myacct.dfs.core.windows.net/curated/']
+
+    catalogs: Optional[List[str]]
+        要掃描的 Unity Catalog 清單
+        None 表示掃描所有可存取的 catalogs
+
+    max_depth: int
+        掃描目錄的最大遞迴深度，預設為 2
+        避免掃描過深導致效能問題
+
+    dry_run: bool
+        Dry-run 模式，預設為 True
+        注意：孤兒目錄掃描本身只做偵測，不執行刪除
+
+    output_format: str
+        報表輸出格式：'notebook'、'log'、'delta_table'
+        預設為 'notebook'
+
+    output_table: Optional[str]
+        如果 output_format='delta_table'，指定輸出的 Delta table 名稱
+        範例: 'main.audit.orphan_paths_report'
+
+    範例
+    -------
+    >>> # 建立基本配置
+    >>> config = OrphanScanConfig(
+    ...     base_paths=['abfss://data@myacct.dfs.core.windows.net/raw/'],
+    ...     catalogs=['main'],
+    ...     max_depth=2
+    ... )
+    >>>
+    >>> # 建立進階配置（輸出到 Delta table）
+    >>> config = OrphanScanConfig(
+    ...     base_paths=['abfss://data@myacct.dfs.core.windows.net/raw/'],
+    ...     catalogs=['main', 'dev'],
+    ...     max_depth=3,
+    ...     output_format='delta_table',
+    ...     output_table='main.audit.orphan_paths_report'
+    ... )
+    """
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        base_paths: Optional[List[str]] = None,
+        catalogs: Optional[List[str]] = None,
+        max_depth: int = 2,
+        dry_run: bool = True,
+        output_format: str = 'notebook',
+        output_table: Optional[str] = None
+    ):
+        self.enabled = enabled
+        self.base_paths = base_paths or []
+        self.catalogs = catalogs
+        self.max_depth = max_depth
+        self.dry_run = dry_run
+        self.output_format = output_format
+        self.output_table = output_table
+
+    def validate(self) -> Tuple[bool, str]:
+        """
+        驗證配置的有效性
+
+        回傳
+        -------
+        Tuple[bool, str]
+            (是否有效, 錯誤訊息)
+        """
+        if not self.enabled:
+            return True, "掃描已停用"
+
+        if not self.base_paths:
+            return False, "必須至少指定一個 base_path"
+
+        if self.max_depth < 1 or self.max_depth > 10:
+            return False, "max_depth 必須介於 1-10 之間"
+
+        if self.output_format not in ['notebook', 'log', 'delta_table']:
+            return False, "output_format 必須是 'notebook'、'log' 或 'delta_table'"
+
+        if self.output_format == 'delta_table' and not self.output_table:
+            return False, "使用 'delta_table' 輸出時必須指定 output_table"
+
+        return True, "配置有效"
+
+    def to_dict(self) -> dict:
+        """
+        將配置轉換為字典格式
+
+        回傳
+        -------
+        dict
+            包含所有配置參數的字典
+        """
+        return {
+            'enabled': self.enabled,
+            'base_paths': self.base_paths,
+            'catalogs': self.catalogs,
+            'max_depth': self.max_depth,
+            'dry_run': self.dry_run,
+            'output_format': self.output_format,
+            'output_table': self.output_table
+        }
+
+    @classmethod
+    def from_dict(cls, config_dict: dict) -> 'OrphanScanConfig':
+        """
+        從字典建立配置實例
+
+        參數
+        ----------
+        config_dict: dict
+            包含配置參數的字典
+
+        回傳
+        -------
+        OrphanScanConfig
+            配置實例
+        """
+        return cls(
+            enabled=config_dict.get('enabled', True),
+            base_paths=config_dict.get('base_paths', []),
+            catalogs=config_dict.get('catalogs'),
+            max_depth=config_dict.get('max_depth', 2),
+            dry_run=config_dict.get('dry_run', True),
+            output_format=config_dict.get('output_format', 'notebook'),
+            output_table=config_dict.get('output_table')
+        )
+
+
+# 孤兒掃描預設配置範例
+DEFAULT_ORPHAN_SCAN_CONFIG = OrphanScanConfig(
+    enabled=True,
+    base_paths=[],  # 需要使用者指定
+    catalogs=None,  # 掃描所有可存取的 catalogs
+    max_depth=2,
+    dry_run=True,
+    output_format='notebook'
+)
