@@ -45,10 +45,66 @@ Databricks External Tables Cleaner 的執行流程分為五個主要階段：
 
 ## 2. 系統架構圖
 
+### 2.1 整體系統架構
+
+```mermaid
+graph TB
+    subgraph "使用者介面層"
+        UI1[Databricks Notebook]
+        UI2[Databricks Job]
+        UI3[Databricks Script]
+    end
+
+    subgraph "應用邏輯層"
+        App1[clean_tables_without_storage.py]
+        App2[clean_tables_with_dryrun.py]
+        App3[自訂腳本]
+    end
+
+    subgraph "核心功能層 - common/"
+        Helper[helpers.py<br/>核心清理邏輯]
+        Config[config.py<br/>配置管理]
+    end
+
+    subgraph "資料與儲存層"
+        Meta[Databricks Metastore<br/>Unity Catalog<br/>表 Metadata]
+        Storage[外部儲存系統<br/>ADLS / S3 / GCS<br/>實際資料檔案]
+    end
+
+    UI1 --> App1
+    UI1 --> App2
+    UI2 --> App1
+    UI2 --> App2
+    UI3 --> App3
+
+    App1 --> Helper
+    App2 --> Helper
+    App2 --> Config
+    App3 --> Helper
+    App3 --> Config
+
+    Helper --> Meta
+    Helper --> Storage
+    Config --> Helper
+
+    style Helper fill:#90EE90
+    style Config fill:#87CEEB
+    style Meta fill:#FFE4B5
+    style Storage fill:#FFE4B5
+```
+
+### 2.2 詳細執行流程圖
+
 ```mermaid
 graph TB
     Start[開始執行] --> Init[初始化參數與 Logger]
-    Init --> SetCatalog[設定 Spark Catalog Context]
+    Init --> LoadConfig{載入配置?}
+    LoadConfig -->|是| CreateConfig[建立 CleanupConfig<br/>設定白名單/黑名單<br/>Dry-run 模式等]
+    LoadConfig -->|否| UseDefault[使用預設配置]
+    
+    CreateConfig --> SetCatalog[設定 Spark Catalog Context]
+    UseDefault --> SetCatalog
+    
     SetCatalog --> ScanTables[掃描 Schema 中的所有表<br/>SHOW TABLES IN store.schema]
 
     ScanTables --> GetDetails[取得每個表的詳細資訊<br/>SHOW TABLE EXTENDED]
@@ -58,7 +114,12 @@ graph TB
 
     Filter --> CheckLoop{遍歷每個表}
 
-    CheckLoop --> CheckProvider{Provider 類型?}
+    CheckLoop --> CheckWhitelist{在白名單中?}
+    CheckWhitelist -->|是| SkipWhitelist[跳過：白名單保護]
+    CheckWhitelist -->|否| CheckBlacklist{在黑名單中?}
+    
+    CheckBlacklist -->|是| SkipBlacklist[跳過：黑名單禁止]
+    CheckBlacklist -->|否| CheckProvider{Provider 類型?}
 
     CheckProvider -->|Delta| CheckDelta[使用 DeltaTable.isDeltaTable<br/>檢查 Location]
     CheckProvider -->|Parquet| CheckParquet[使用 dbutils.fs.ls<br/>檢查 Location]
@@ -67,47 +128,189 @@ graph TB
     CheckParquet --> ParquetExists{路徑存在?}
 
     DeltaExists -->|是| SkipDelta[記錄：資料存在，跳過]
-    DeltaExists -->|否| DeleteDelta[執行 DROP TABLE]
-
+    DeltaExists -->|否| CheckDryRun{Dry-run 模式?}
+    
     ParquetExists -->|是| SkipParquet[記錄：資料存在，跳過]
-    ParquetExists -->|否| DeleteParquet[執行 DROP TABLE]
+    ParquetExists -->|否| CheckDryRun
 
-    DeleteDelta --> LogDelete1[記錄刪除操作]
-    DeleteParquet --> LogDelete2[記錄刪除操作]
+    CheckDryRun -->|是| LogDryRun[記錄：將被刪除<br/>DRY-RUN]
+    CheckDryRun -->|否| DeleteTable[執行 DROP TABLE]
 
+    DeleteTable --> LogDelete[記錄刪除操作]
+
+    SkipWhitelist --> NextTable
+    SkipBlacklist --> NextTable
     SkipDelta --> NextTable
     SkipParquet --> NextTable
-    LogDelete1 --> NextTable[處理下一個表]
-    LogDelete2 --> NextTable
+    LogDryRun --> NextTable[處理下一個表]
+    LogDelete --> NextTable
 
     NextTable --> CheckLoop
 
-    CheckLoop -->|完成所有表| Summary[統計並輸出結果<br/>已刪除 X 個表，共檢查 Y 個表]
-    Summary --> End[結束]
+    CheckLoop -->|完成所有表| Summary[統計並輸出結果<br/>已刪除/將刪除 X 個表<br/>跳過 Y 個表]
+    Summary --> NeedConfirm{需要確認?}
+    
+    NeedConfirm -->|是| ShowConfirm[顯示候選表清單<br/>要求使用者確認]
+    NeedConfirm -->|否| End[結束]
+    
+    ShowConfirm --> UserConfirm{使用者確認?}
+    UserConfirm -->|YES| End
+    UserConfirm -->|取消| Cancel[取消操作]
+    Cancel --> End
 
     style Init fill:#e1f5ff
-    style DeleteDelta fill:#ffcccc
-    style DeleteParquet fill:#ffcccc
+    style CreateConfig fill:#e1f5ff
+    style CheckWhitelist fill:#FFE4B5
+    style CheckBlacklist fill:#FFE4B5
+    style DeleteTable fill:#ffcccc
+    style LogDryRun fill:#90EE90
     style Summary fill:#ccffcc
+```
+
+### 2.3 模組互動圖
+
+```mermaid
+sequenceDiagram
+    participant User as 使用者/Job
+    participant App as 應用層<br/>(Notebook/Script)
+    participant Config as CleanupConfig<br/>(配置管理)
+    participant Helper as helpers.py<br/>(核心功能)
+    participant Meta as Metastore<br/>(表 Metadata)
+    participant Storage as 外部儲存<br/>(ADLS/S3)
+
+    User->>App: 設定參數<br/>(store, schema, dry_run等)
+    App->>Config: 建立配置實例<br/>CleanupConfig(...)
+    Config-->>App: 配置物件
+    
+    App->>Helper: get_tables(spark, store, schema)
+    Helper->>Meta: SHOW TABLES IN store.schema
+    Meta-->>Helper: 表清單
+    Helper-->>App: tables[]
+    
+    App->>Helper: get_tables_details(spark, store, schema, tables)
+    loop 每個表
+        Helper->>Meta: SHOW TABLE EXTENDED
+        Meta-->>Helper: 表詳細資訊
+    end
+    Helper-->>App: tableDetailsDF
+    
+    App->>Helper: drop_table_definition_without_storage_safe<br/>(spark, df, logger, config)
+    
+    loop 每個表
+        Helper->>Config: is_table_deletion_allowed(table_name)
+        Config-->>Helper: (允許/不允許, 原因)
+        
+        alt 允許刪除
+            Helper->>Storage: 檢查 Location 是否存在
+            Storage-->>Helper: 存在/不存在
+            
+            alt 儲存不存在 & dry_run=False
+                Helper->>Meta: DROP TABLE
+                Meta-->>Helper: 刪除成功
+            else dry_run=True
+                Helper->>Helper: 記錄將被刪除
+            end
+        else 不允許
+            Helper->>Helper: 記錄跳過原因
+        end
+    end
+    
+    Helper-->>App: (刪除數量, 候選表清單)
+    
+    opt 需要確認
+        App->>Helper: confirm_deletion_interactive(candidates)
+        Helper->>User: 顯示候選表清單
+        User-->>Helper: 輸入確認
+        Helper-->>App: 確認結果
+    end
+    
+    App->>User: 顯示最終統計結果
+```
+
+### 2.4 資料流程圖
+
+```mermaid
+flowchart LR
+    subgraph Input["輸入資料"]
+        P1[Metastore/Catalog 名稱]
+        P2[Schema 名稱]
+        P3[配置參數]
+    end
+
+    subgraph Processing["處理流程"]
+        S1[掃描表清單]
+        S2[取得表詳細資訊]
+        S3[應用過濾規則<br/>白名單/黑名單]
+        S4[檢查儲存狀態]
+        S5[決策：刪除/跳過]
+    end
+
+    subgraph Output["輸出結果"]
+        O1[刪除的表清單]
+        O2[跳過的表清單]
+        O3[失敗的表清單]
+        O4[統計摘要]
+        O5[執行日誌]
+    end
+
+    Input --> Processing
+    Processing --> Output
+
+    P1 --> S1
+    P2 --> S1
+    P3 --> S3
+
+    S1 --> S2
+    S2 --> S3
+    S3 --> S4
+    S4 --> S5
+
+    S5 --> O1
+    S5 --> O2
+    S5 --> O3
+    S5 --> O4
+    S5 --> O5
+
+    style Input fill:#e1f5ff
+    style Processing fill:#90EE90
+    style Output fill:#FFE4B5
 ```
 
 ### 架構說明
 
 **使用者介面層：**
 - Databricks Job 或手動執行的 Notebook
-- 提供參數輸入（store、schema、debug）
+- 提供參數輸入（store、schema、debug、dry_run等）
+- 可透過 Widgets 互動式設定參數
 
 **應用邏輯層：**
-- `scripts/clean_tables_without_storage.py` 或 `notebooks/clean_tables_without_storage.py`
-- 協調整體流程
+- `scripts/clean_tables_without_storage.py`：基本版本的執行腳本
+- `notebooks/clean_tables_without_storage.py`：Notebook 版本
+- `notebooks/clean_tables_with_dryrun.py`：進階安全模式版本
+- 協調整體流程，呼叫核心功能
 
 **核心功能層：**
-- `common/helpers.py` 模組
-- 包含所有核心函式
+- `common/helpers.py` 模組：包含所有核心清理函式
+  - 表掃描與查詢
+  - 儲存檢查
+  - 刪除邏輯
+  - 日誌管理
+- `common/config.py` 模組：配置管理
+  - 白名單/黑名單控制
+  - 保留條件管理
+  - Dry-run 設定
 
 **資料與儲存層：**
 - Databricks Metastore / Unity Catalog：儲存表的 metadata
 - 外部儲存系統（ADLS、S3、GCS）：實際資料檔案位置
+
+**安全控制層級：**
+1. **第一層：白名單檢查** - 優先級最高，永不刪除
+2. **第二層：黑名單檢查** - 禁止刪除
+3. **第三層：保留條件** - 基於時間的篩選
+4. **第四層：儲存檢查** - 驗證資料是否存在
+5. **第五層：Dry-run 模式** - 預覽而非實際執行
+6. **第六層：互動確認** - 使用者二次確認
 
 ## 3. 模組說明
 

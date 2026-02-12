@@ -1,3 +1,16 @@
+"""
+Databricks External Tables Cleaner - 核心功能測試
+
+本測試模組涵蓋：
+- file_exists 函式：檔案/目錄存在性檢查
+- get_tables 函式：表清單查詢
+- get_tables_details 函式：表詳細資訊查詢
+- create_empty_dataframe 函式：空 DataFrame 建立
+- drop_table_definition_without_storage 函式：清理邏輯
+
+所有測試都需要連接到實際的 Databricks cluster 才能執行。
+"""
+
 import pytest
 from context import *
 from databricks.connect import DatabricksSession
@@ -6,45 +19,72 @@ import pandas as pd
 
 @pytest.fixture(scope="session")
 def spark() -> DatabricksSession:
-  # Create a DatabricksSession (the entry point to Spark functionality) on
-  # the cluster in the remote Databricks workspace. Unit tests do not
-  # have access to this DatabricksSession by default.
-  return DatabricksSession.builder.getOrCreate()
+    """
+    建立 Databricks Spark Session fixture
+    
+    此 fixture 會在整個測試 session 中只建立一次，
+    所有測試函式共用同一個 spark session。
+    
+    回傳
+    -------
+    DatabricksSession
+        連接到遠端 Databricks cluster 的 Spark session
+    
+    注意事項
+    -------
+    需要事先設定 databricks-connect 並連接到有效的 cluster
+    """
+    # 建立 DatabricksSession（連接到遠端 Databricks workspace 的 cluster）
+    # 單元測試預設無法存取這個 session，因此需要透過 fixture 提供
+    return DatabricksSession.builder.getOrCreate()
 
+
+# ============================================================================
+# file_exists 函式測試
+# ============================================================================
 
 def test_file_exists_should_work_when_path_is_invalid(spark):
-    # ARRANGE
-    path = '\mnt'
+    """測試 file_exists 應該在路徑格式無效時回傳 False"""
+    # ARRANGE：準備一個格式無效的路徑
+    path = '\mnt'  # 缺少前導斜線的無效路徑
     
-    # ACT
-    output = file_exists(spark,path)
+    # ACT：執行檢查
+    output = file_exists(spark, path)
     expected = False
 
-    # ASSERT 
-    assert (output == expected)
+    # ASSERT：驗證結果
+    assert (output == expected), f"預期 {expected}，但得到 {output}"
+
 
 def test_file_should_return_true_when_target_folder_exists(spark):
-   # ARRANGE
+    """測試 file_exists 應該在目標目錄存在時回傳 True"""
+    # ARRANGE：準備一個存在的路徑（/mnt 是 Databricks 中常見的掛載點）
     path = '/mnt'
 
-    # ACT
-    output = file_exists(spark,path)
+    # ACT：執行檢查
+    output = file_exists(spark, path)
     expected = True
 
-    # ASSERT 
-    assert (output == expected)
+    # ASSERT：驗證結果
+    assert (output == expected), f"預期 {expected}，但得到 {output}"
+
 
 def test_file_should_return_false_when_target_folder_doesnt_exist(spark):
-   # ARRANGE
-    path = '/mnt/hello'
+    """測試 file_exists 應該在目標目錄不存在時回傳 False"""
+    # ARRANGE：準備一個不存在的路徑
+    path = '/mnt/hello'  # 假設這個路徑不存在
 
-    # ACT
-    output = file_exists(spark,path)
+    # ACT：執行檢查
+    output = file_exists(spark, path)
     expected = False
 
-    # ASSERT 
-    assert (output == expected)
+    # ASSERT：驗證結果
+    assert (output == expected), f"預期 {expected}，但得到 {output}"
 
+
+# ============================================================================
+# get_tables 函式測試
+# ============================================================================
 
 def test_get_tables_should_return_just_temporary_tables(spark):
     # ARRANGE
