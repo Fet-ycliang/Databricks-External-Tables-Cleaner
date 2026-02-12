@@ -192,6 +192,63 @@ deleted, candidates = drop_table_definition_without_storage_safe(
 
 詳細配置範例請參考：[docs/config-examples.md](docs/config-examples.md)
 
+## 系統架構總覽
+
+### 整體架構圖
+
+```mermaid
+graph TB
+    subgraph "使用者介面層"
+        UI1[Databricks Notebook]
+        UI2[Databricks Job]
+    end
+
+    subgraph "應用邏輯層"
+        App1[clean_tables_without_storage.py]
+        App2[clean_tables_with_dryrun.py<br/>進階安全模式]
+    end
+
+    subgraph "核心功能層"
+        Helper[helpers.py<br/>表掃描/檢查/刪除]
+        Config[config.py<br/>白名單/黑名單/配置]
+    end
+
+    subgraph "資料層"
+        Meta[Metastore/Unity Catalog<br/>表 Metadata]
+        Storage[外部儲存 ADLS/S3/GCS<br/>實際資料]
+    end
+
+    UI1 --> App1
+    UI1 --> App2
+    UI2 --> App1
+    UI2 --> App2
+
+    App1 --> Helper
+    App2 --> Helper
+    App2 --> Config
+
+    Helper --> Meta
+    Helper --> Storage
+    Config --> Helper
+
+    style Helper fill:#90EE90
+    style Config fill:#87CEEB
+    style Meta fill:#FFE4B5
+    style Storage fill:#FFE4B5
+```
+
+### 執行流程
+
+1. **參數設定** → 使用者透過 Notebook Widgets 或 Job 參數設定 store、schema 等資訊
+2. **配置初始化** → 建立 CleanupConfig，設定白名單/黑名單、Dry-run 模式
+3. **掃描表清單** → 使用 `SHOW TABLES` 取得所有表
+4. **取得詳細資訊** → 對每個表執行 `SHOW TABLE EXTENDED`
+5. **過濾與檢查** → 應用白名單/黑名單規則，檢查儲存是否存在
+6. **執行決策** → 根據 Dry-run 模式決定是否實際刪除
+7. **輸出結果** → 顯示統計摘要與候選表清單
+
+更詳細的架構說明請參考：[docs/system-design.md](docs/system-design.md)
+
 ## 專案目錄結構
 
 ```
