@@ -255,14 +255,17 @@ graph TB
 Databricks-External-Tables-Cleaner/
 ├── common/                      # 共用工具模組
 │   ├── helpers.py              # 核心功能函式（表掃描、檢查、刪除等）
-│   └── config.py               # 配置管理（白名單/黑名單、保留條件） ✨ NEW
+│   ├── config.py               # 配置管理（白名單/黑名單、保留條件） ✨ NEW
+│   └── orphan_paths_scanner.py # 孤兒目錄掃描模組 ✨ NEW
 ├── scripts/                     # 可執行腳本
 │   ├── context.py              # 模組路徑設定
-│   └── clean_tables_without_storage.py  # 主要清理腳本
+│   ├── clean_tables_without_storage.py  # 主要清理腳本
+│   └── scan_orphan_paths.py    # 孤兒目錄掃描腳本 ✨ NEW
 ├── notebooks/                   # Databricks Notebook
 │   ├── context.py              # 模組路徑設定
 │   ├── clean_tables_without_storage.py  # Notebook 版本的清理工具
-│   └── clean_tables_with_dryrun.py     # 進階安全模式範例 ✨ NEW
+│   ├── clean_tables_with_dryrun.py     # 進階安全模式範例 ✨ NEW
+│   └── scan_orphan_paths.py    # 孤兒目錄掃描 Notebook ✨ NEW
 ├── tests/                       # 單元測試
 │   ├── context.py              # 測試環境設定
 │   ├── test_clean_tables_without_storage.py  # 測試案例
@@ -282,14 +285,18 @@ Databricks-External-Tables-Cleaner/
   - 表列舉與詳細資訊查詢
   - 檔案存在性檢查
   - 表定義刪除邏輯（含 dry-run 支援）
+  - 孤兒目錄掃描功能 ✨ NEW
   - 日誌管理
   - 配置管理與安全控制
 
 - **scripts/**：獨立的 Python 腳本，可在 Databricks 或本地執行
+  - `clean_tables_without_storage.py`：清理孤兒表定義
+  - `scan_orphan_paths.py`：掃描孤兒目錄 ✨ NEW
 
 - **notebooks/**：Databricks Notebook 格式，包含 Magic Commands 和 Widget 設定
   - `clean_tables_without_storage.py`：原始版本（向後相容）
   - `clean_tables_with_dryrun.py`：進階安全模式版本
+  - `scan_orphan_paths.py`：孤兒目錄掃描 Notebook ✨ NEW
 
 - **tests/**：使用 pytest 的單元測試，可透過 databricks-connect 在遠端 cluster 上執行
 
