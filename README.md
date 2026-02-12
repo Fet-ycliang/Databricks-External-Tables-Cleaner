@@ -192,20 +192,141 @@ deleted, candidates = drop_table_definition_without_storage_safe(
 
 詳細配置範例請參考：[docs/config-examples.md](docs/config-examples.md)
 
+## 孤兒目錄偵測功能 ✨ NEW
+
+### 功能說明
+
+除了從 Unity Catalog 角度清理孤兒表定義，本工具現在也支援**從 Storage 角度反向檢查**，偵測未被 Unity Catalog 引用的「孤兒目錄」。
+
+這個功能可以幫助您找出以下情況：
+- 在 Storage 中存在但未被任何 External Table 引用的目錄
+- 未被任何 External Volume 引用的目錄
+- 未被任何 External Location 管理的目錄
+
+### 使用方式
+
+#### 透過 Notebook 執行
+
+1. 開啟 `notebooks/scan_orphan_paths.py`
+2. 設定 Widget 參數：
+   - **base_paths**：要掃描的 Storage 路徑（逗號分隔）
+     - 範例：`abfss://data@myacct.dfs.core.windows.net/raw/`
+   - **catalogs**：要掃描的 Unity Catalog 清單（空白表示掃描全部）
+     - 範例：`main, dev`
+   - **max_depth**：掃描目錄的最大深度（1-5）
+   - **output_format**：輸出格式（notebook / log / delta_table）
+   - **output_table**：如選擇 delta_table，指定輸出的 table 名稱
+3. 執行整個 notebook
+
+#### 透過腳本執行
+
+```python
+from common.helpers import logs
+from common.orphan_paths_scanner import scan_orphan_paths
+from common.config import OrphanScanConfig
+
+# 初始化日誌
+logger = logs(name='OrphanScanner', level='info', debug=True)
+
+# 建立配置
+config = OrphanScanConfig(
+    base_paths=['abfss://data@myacct.dfs.core.windows.net/raw/'],
+    catalogs=['main'],
+    max_depth=2,
+    output_format='notebook'
+)
+
+# 執行掃描
+orphans, report_df = scan_orphan_paths(
+    spark=spark,
+    log=logger,
+    base_paths=config.base_paths,
+    catalogs=config.catalogs,
+    max_depth=config.max_depth
+)
+
+# 顯示結果
+report_df.show()
+print(f'找到 {len(orphans)} 個孤兒目錄')
+```
+
+### 掃描邏輯
+
+1. **收集 Unity Catalog 引用的路徑**
+   - 取回所有 External Tables 的 LOCATION
+   - 取回所有 External Volumes 的 storage_location
+   - 取回所有 External Locations 的 url
+   - 將路徑正規化為統一格式
+
+2. **掃描 Storage 實際目錄**
+   - 從指定的 base_paths 開始遞迴掃描
+   - 根據 max_depth 限制掃描深度
+
+3. **比對並找出孤兒目錄**
+   - 檢查每個 Storage 目錄是否被 UC 引用
+   - 列出未被引用的目錄及其詳細資訊
+
+### 輸出報表格式
+
+報表包含以下欄位：
+- **path**：目錄路徑
+- **size_bytes**：估算大小（bytes）
+- **size_formatted**：格式化後的大小（KB/MB/GB）
+- **last_modified**：最後修改時間
+- **reason**：判定為孤兒目錄的原因
+
+### ⚠️ 重要說明
+
+1. **僅偵測，不刪除**：此功能只用於列出孤兒目錄，**不會刪除任何資料**
+2. **權限需求**：
+   - Unity Catalog: `USE CATALOG`、`USE SCHEMA`、`SELECT` 權限
+   - Storage: 讀取權限（list 和 read）
+   - External Locations: `SELECT` 權限
+3. **效能考量**：掃描深度越大、路徑越多，執行時間越長
+4. **建議搭配使用**：與 External Tables Cleaner 形成「由 UC 出發清理」＋「由 Storage 反查補漏」的雙向治理策略
+
+### 配置範例
+
+```python
+from common.config import OrphanScanConfig
+
+# 基本配置
+config = OrphanScanConfig(
+    base_paths=['abfss://data@myacct.dfs.core.windows.net/raw/'],
+    catalogs=['main'],
+    max_depth=2
+)
+
+# 進階配置（輸出到 Delta Table）
+config = OrphanScanConfig(
+    base_paths=[
+        'abfss://data@myacct.dfs.core.windows.net/raw/',
+        'abfss://data@myacct.dfs.core.windows.net/curated/'
+    ],
+    catalogs=['main', 'dev'],
+    max_depth=3,
+    output_format='delta_table',
+    output_table='main.audit.orphan_paths_report'
+)
+```
+
 ## 專案目錄結構
 
 ```
 Databricks-External-Tables-Cleaner/
 ├── common/                      # 共用工具模組
 │   ├── helpers.py              # 核心功能函式（表掃描、檢查、刪除等）
-│   └── config.py               # 配置管理（白名單/黑名單、保留條件） ✨ NEW
+│   ├── config.py               # 配置管理（白名單/黑名單、保留條件） ✨ NEW
+│   └── orphan_paths_scanner.py # 孤兒目錄掃描模組 ✨ NEW
 ├── scripts/                     # 可執行腳本
 │   ├── context.py              # 模組路徑設定
-│   └── clean_tables_without_storage.py  # 主要清理腳本
+│   ├── clean_tables_without_storage.py  # 主要清理腳本
+│   └── scan_orphan_paths.py    # 孤兒目錄掃描腳本 ✨ NEW
 ├── notebooks/                   # Databricks Notebook
 │   ├── context.py              # 模組路徑設定
 │   ├── clean_tables_without_storage.py  # Notebook 版本的清理工具
-│   └── clean_tables_with_dryrun.py     # 進階安全模式範例 ✨ NEW
+│   ├── clean_tables_with_dryrun.py     # 進階安全模式範例 ✨ NEW
+│   └── scan_orphan_paths.py    # 孤兒目錄掃描 Notebook ✨ NEW
 ├── tests/                       # 單元測試
 │   ├── context.py              # 測試環境設定
 │   ├── test_clean_tables_without_storage.py  # 測試案例
@@ -225,14 +346,18 @@ Databricks-External-Tables-Cleaner/
   - 表列舉與詳細資訊查詢
   - 檔案存在性檢查
   - 表定義刪除邏輯（含 dry-run 支援）
+  - 孤兒目錄掃描功能 ✨ NEW
   - 日誌管理
   - 配置管理與安全控制
 
 - **scripts/**：獨立的 Python 腳本，可在 Databricks 或本地執行
+  - `clean_tables_without_storage.py`：清理孤兒表定義
+  - `scan_orphan_paths.py`：掃描孤兒目錄 ✨ NEW
 
 - **notebooks/**：Databricks Notebook 格式，包含 Magic Commands 和 Widget 設定
   - `clean_tables_without_storage.py`：原始版本（向後相容）
   - `clean_tables_with_dryrun.py`：進階安全模式版本
+  - `scan_orphan_paths.py`：孤兒目錄掃描 Notebook ✨ NEW
 
 - **tests/**：使用 pytest 的單元測試，可透過 databricks-connect 在遠端 cluster 上執行
 
